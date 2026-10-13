@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Offline AI">
+<meta name="theme-color" content="#1f2937">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" href="icon-192.png">
+<link rel="stylesheet" href="style.css">
+<title>iPad Offline AI</title>
+</head>
+<body>
+<header class="top">
+  <div class="brand">iPad Offline AI</div>
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-view="chat">チャット</button>
+    <button class="tab" data-view="models">モデル管理</button>
+    <button class="tab" data-view="status">状態・ヘルプ</button>
+  </nav>
+  <div class="current" id="currentModel">モデル：未読み込み</div>
+</header>
+
+<div id="banner" class="banner hidden"></div>
+
+<main>
+  <!-- チャット -->
+  <section id="view-chat" class="view active">
+    <div id="messages" class="messages" aria-live="polite">
+      <div class="empty" id="emptyChat">
+        <p>まず「モデル管理」で小さなモデルをダウンロードして読み込んでください。</p>
+        <button class="big primary" data-goto="models">モデル管理を開く</button>
+      </div>
+    </div>
+    <div id="genStatus" class="genstatus hidden"></div>
+    <form id="chatForm" class="composer">
+      <textarea id="input" rows="2" placeholder="メッセージを入力…" enterkeyhint="send"></textarea>
+      <div class="composer-btns">
+        <button type="submit" id="sendBtn" class="big primary">送信</button>
+        <button type="button" id="stopBtn" class="big danger hidden">停止</button>
+      </div>
+    </form>
+    <div class="chat-tools">
+      <select id="convSelect" class="small" aria-label="会話履歴"></select>
+      <button id="newChatBtn" class="small">新しい会話</button>
+      <button id="clearBtn" class="small danger-outline">会話履歴を消去</button>
+    </div>
+  </section>
+
+  <!-- モデル管理 -->
+  <section id="view-models" class="view">
+    <h2>モデル管理</h2>
+    <p class="note">モデルは初回のみインターネットからダウンロードします。ダウンロード後は、この端末のブラウザ内に保存され、オフラインで使えます（ブラウザが保存データを削除した場合は再ダウンロードが必要です）。</p>
+    <div id="dlPanel" class="dlpanel hidden">
+      <div class="dl-title" id="dlTitle"></div>
+      <div class="bar"><div id="dlBar"></div></div>
+      <div class="dl-text" id="dlText"></div>
+      <button id="cancelDlBtn" class="big danger">ダウンロードをキャンセル</button>
+    </div>
+    <div id="dlError" class="errorbox hidden"></div>
+    <h3>ダウンロード済みモデル</h3>
+    <div id="installedList" class="list"></div>
+    <h3>利用可能なモデル</h3>
+    <p class="note" id="listNote"></p>
+    <div id="availableList" class="list"></div>
+  </section>
+
+  <!-- 状態・ヘルプ -->
+  <section id="view-status" class="view">
+    <h2>状態・オフライン確認</h2>
+    <div class="card">
+      <div id="statusTable"></div>
+      <div class="row">
+        <button id="refreshStatusBtn" class="big">状態を更新</button>
+        <button id="persistBtn" class="big">保存データの保護を要求</button>
+      </div>
+    </div>
+    <h2>使い方</h2>
+    <div class="card help">
+      <ol>
+        <li>Wi-Fiに接続した状態でこのページを開きます。</li>
+        <li>「モデル管理」で小さいモデル（まず1B前後）を選び「ダウンロードして読み込む」を押します。</li>
+        <li>完了後、「状態・ヘルプ」で「オフライン準備」がすべて✅になっているか確認します。</li>
+        <li>共有ボタン →「ホーム画面に追加」で、ホーム画面から起動できるようにします。</li>
+        <li>機内モードにしてホーム画面のアイコンから起動し、モデルを読み込んで会話できれば成功です。</li>
+      </ol>
+      <p class="note">うまくいかないときは、画面に表示される日本語の説明に従ってください。モデルが大きすぎるとSafariがページを強制終了することがあります。その場合は小さいモデルに切り替えてください。</p>
+    </div>
+  </section>
+</main>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
