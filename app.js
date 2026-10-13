@@ -243,36 +243,69 @@ function jaNote(id) {
 }
 function fmtMB(mb) { return mb >= 1024 ? (mb / 1024).toFixed(1) + " GB" : Math.round(mb) + " MB"; }
 
+function withTimeout(p, ms) {
+  return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms))]);
+}
+async function isCached(id) {
+  try { return await withTimeout(webllm.hasModelInCache(id), 4000); } catch { return null; } // null = 確認できず
+}
 async function cachedMap(models) {
   const res = {};
-  await Promise.all(models.map(async (m) => {
-    try { res[m.model_id] = await webllm.hasModelInCache(m.model_id); } catch { res[m.model_id] = false; }
-  }));
+  await Promise.all(models.map(async (m) => { res[m.model_id] = await isCached(m.model_id); }));
   return res;
 }
+function jaScore(id) {
+  if (/qwen/i.test(id)) return 0;
+  if (/gemma/i.test(id)) return 1;
+  return 2;
+}
+let listSeq = 0;
 async function refreshModelLists() {
+  const seq = ++listSeq;
   const inst = $("installedList");
   const avail = $("availableList");
-  if (!webllm) {
+  try {
+    if (!webllm) {
+      inst.textContent = "";
+      avail.textContent = "";
+      $("listNote").textContent = "WebLLMを読み込めていません。オンラインでこのページを開き直してください。";
+      return;
+    }
+    const models = candidateModels().sort((a, b) => jaScore(a.model_id) - jaScore(b.model_id) || a.vram_required_MB - b.vram_required_MB);
+    $("listNote").textContent = "必要GPUメモリ " + fmtMB(MAX_VRAM_MB) + " 以下のモデルのみ表示。日本語に向くQwen系・Gemma系を上に並べています。ダウンロード容量はおおよその目安です。";
+    // まず一覧をすぐ表示（保存状況の確認で止まっても一覧は見える）
     inst.textContent = "";
     avail.textContent = "";
-    $("listNote").textContent = "WebLLMを読み込めていません。オンラインでこのページを開き直してください。";
-    return;
+    if (models.length === 0) {
+      avail.textContent = "表示できるモデルがありません（WebLLMのモデル一覧が空です）。";
+      return;
+    }
+    const ph = document.createElement("p");
+    ph.className = "note";
+    ph.textContent = "保存状況を確認中…";
+    inst.appendChild(ph);
+    models.forEach((m) => avail.appendChild(modelCard(m, false)));
+    const cached = await cachedMap(models);
+    if (seq !== listSeq) return;     // 新しい更新が始まっていたら捨てる
+    inst.textContent = "";
+    avail.textContent = "";
+    const have = models.filter((m) => cached[m.model_id] === true);
+    const unknown = models.some((m) => cached[m.model_id] === null);
+    if (have.length === 0) {
+      const p = document.createElement("p");
+      p.className = "note";
+      p.textContent = unknown
+        ? "保存状況を確認できませんでした（ブラウザの保存領域の応答がありません）。「状態・ヘルプ」の「アプリを初期化」を試してください。"
+        : "まだダウンロード済みのモデルはありません。";
+      inst.appendChild(p);
+    }
+    have.forEach((m) => inst.appendChild(modelCard(m, true)));
+    models.filter((m) => cached[m.model_id] !== true).forEach((m) => avail.appendChild(modelCard(m, false)));
+  } catch (e) {
+    inst.textContent = "";
+    avail.textContent = "";
+    $("listNote").textContent = "一覧の表示でエラー：" + (e && e.message ? e.message : e) + "（「状態・ヘルプ」の「アプリを初期化」を試してください）";
   }
-  const models = candidateModels();
-  const cached = await cachedMap(models);
-  inst.textContent = "";
-  avail.textContent = "";
-  $("listNote").textContent = "必要GPUメモリ " + fmtMB(MAX_VRAM_MB) + " 以下のモデルのみ表示しています。ダウンロード容量はおおよその目安です。まずいちばん小さいモデルで試してください。";
-  const have = models.filter((m) => cached[m.model_id]);
-  if (have.length === 0) {
-    const p = document.createElement("p");
-    p.className = "note";
-    p.textContent = "まだダウンロード済みのモデルはありません。";
-    inst.appendChild(p);
-  }
-  have.forEach((m) => inst.appendChild(modelCard(m, true)));
-  models.filter((m) => !cached[m.model_id]).forEach((m) => avail.appendChild(modelCard(m, false)));
 }
 function modelCard(m, installed) {
   const div = document.createElement("div");
@@ -457,7 +490,7 @@ async function refreshStatus() {
   let swOk = false, appN = 0, cdnN = 0;
   try {
     swOk = !!(navigator.serviceWorker && navigator.serviceWorker.controller);
-    appN = (await (await caches.open("ioa-app-v1")).keys()).length;
+    appN = (await (await caches.open("ioa-app-v2")).keys()).length;
     cdnN = (await (await caches.open("ioa-cdn-v1")).keys()).length;
   } catch {}
   add("Service Worker", swOk ? "✅ 有効" : "⚠️ まだ有効ではありません（ページを再読み込みしてください）");
@@ -468,7 +501,7 @@ async function refreshStatus() {
   if (webllm) {
     const models = candidateModels();
     const cached = await cachedMap(models);
-    models.forEach((m) => { if (cached[m.model_id]) { nModels++; if (LS.get("ioa.ok." + m.model_id, false)) okModels++; } });
+    models.forEach((m) => { if (cached[m.model_id] === true) { nModels++; if (LS.get("ioa.ok." + m.model_id, false)) okModels++; } });
   }
   add("保存済みモデル", nModels + " 個（うち読み込み成功済み " + okModels + " 個）");
   add("使用中モデル", loadedModelId || "なし");
@@ -507,6 +540,17 @@ $("persistBtn").addEventListener("click", async () => {
   } catch (e) { banner(friendlyError(e), true); }
   refreshStatus();
 });
+
+$("resetBtn").addEventListener("click", async () => {
+  if (!confirm("このアプリの保存データ（ダウンロード済みモデル・会話履歴・設定）をすべて削除して初期化します。よろしいですか？")) return;
+  try {
+    if (navigator.serviceWorker) { for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister(); }
+    for (const k of await caches.keys()) await caches.delete(k);
+    localStorage.clear();
+  } catch (e) { console.warn(e); }
+  location.reload();
+});
+window.addEventListener("unhandledrejection", (e) => { console.warn("unhandled", e.reason); });
 
 /* ---------- 起動 ---------- */
 async function init() {
