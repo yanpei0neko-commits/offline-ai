@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="stylesheet" href="style.css">
+<title>実験ページ（GGUF / wllama）</title>
+<style>
+  body{display:block;height:auto;overflow:auto;padding-top:env(safe-area-inset-top)}
+  .wrap{max-width:900px;margin:0 auto;padding:16px 16px 60px}
+  .card{margin:14px 0}
+  h1{font-size:22px;margin:6px 0}
+  h2{font-size:19px;margin:0 0 10px}
+  label{display:block;margin:12px 0 4px;font-size:15px;color:var(--sub)}
+  select,input[type=text],input[type=number],textarea{font:inherit;font-size:17px;padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:var(--bg);color:var(--text);width:100%}
+  textarea{min-height:84px;resize:vertical}
+  .row2{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+  pre{white-space:pre-wrap;word-break:break-all;font-size:13px;line-height:1.5;max-height:340px;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:10px;margin:8px 0 0}
+  .out{font-size:17px;line-height:1.7;white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:12px;min-height:60px;margin-top:10px}
+  .warn{background:#fef3c7;color:#78350f;border-radius:14px;padding:12px 16px;line-height:1.6;margin:10px 0}
+  .warn.bad{background:#fee2e2;color:#7f1d1d}
+  .bar{margin-top:10px}
+  .crow{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--line);word-break:break-all;font-size:15px}
+  .pbar{height:16px;background:var(--bg);border-radius:999px;overflow:hidden;border:1px solid var(--line);margin-top:12px}
+  .pbar>div{height:100%;width:0;background:var(--primary)}
+  a.back{color:var(--primary);font-size:17px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="index.html">← アプリに戻る</a>
+  <h1>実験ページ（GGUF / wllama）</h1>
+  <p class="note">いつものアプリとは別のエンジン（llama.cpp系・WebGPU）を、このiPadで試すためのページです。メモリと速度を測り、結果をコピーして私に送ってください。会話の内容は外部に送信されません（モデルのダウンロード時だけ通信します）。</p>
+  <div id="crashBox" class="warn bad hidden"></div>
+
+  <div class="card">
+    <h2>1. この端末の状態</h2>
+    <div id="envTable"></div>
+    <div class="row2"><button id="envBtn" class="big">状態を更新</button></div>
+  </div>
+
+  <div class="card">
+    <h2>2. 設定</h2>
+    <label for="preset">モデル（GGUF形式。Hugging Faceから取得）</label>
+    <select id="preset"></select>
+    <label for="url">モデルのURL（上で「自分で入力」を選んだとき）</label>
+    <input type="text" id="url" placeholder="https://huggingface.co/…/resolve/main/…gguf" autocapitalize="off" autocorrect="off" spellcheck="false">
+    <label for="nctx">会話の長さ（n_ctx）。小さいほど軽い</label>
+    <select id="nctx"><option>512</option><option selected>1024</option><option>2048</option><option>4096</option></select>
+    <label for="ngl">GPUに載せる層の数</label>
+    <select id="ngl"><option value="all" selected>すべてGPU（既定・最速のはず）</option><option value="0">0（CPUのみ・比較用）</option><option value="12">12層</option><option value="24">24層</option></select>
+    <label for="compat">互換モード（Safariは必須。通常は自動のまま）</label>
+    <select id="compat"><option value="auto" selected>自動（推奨）</option><option value="off">無効（Safariでは動かないはず・比較用）</option></select>
+    <label for="ver">wllamaのバージョン</label>
+    <select id="ver"><option>3.8.1</option><option>3.5.1</option></select>
+  </div>
+
+  <div class="card">
+    <h2>3. 読み込み</h2>
+    <div class="row2">
+      <button id="loadBtn" class="big primary">ダウンロードして読み込む</button>
+      <button id="exitBtn" class="big">解放（メモリを空ける）</button>
+    </div>
+    <div class="pbar"><div id="dlBar"></div></div>
+    <p class="note" id="loadState">未読み込み</p>
+  </div>
+
+  <div class="card">
+    <h2>4. 会話テスト</h2>
+    <label for="prompt">質問</label>
+    <textarea id="prompt">日本の首都について、3文で説明してください。</textarea>
+    <div class="row2">
+      <button id="sendBtn" class="big primary">送信</button>
+      <button id="benchBtn" class="big">速度テスト（固定の質問）</button>
+      <button id="stopBtn" class="big danger hidden">停止</button>
+    </div>
+    <div class="out" id="out"></div>
+    <p class="note" id="stats"></p>
+  </div>
+
+  <div class="card">
+    <h2>5. 保存されているモデル</h2>
+    <div id="cacheList"></div>
+    <div class="row2">
+      <button id="cacheBtn" class="big">一覧を更新</button>
+      <button id="cacheClearBtn" class="big danger-outline">すべて削除</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>6. 結果（これを私に送ってください）</h2>
+    <div class="row2">
+      <button id="reportBtn" class="big primary">結果をまとめてコピー</button>
+      <button id="logClearBtn" class="big">ログを消す</button>
+    </div>
+    <textarea id="report" readonly placeholder="ここに結果が出ます"></textarea>
+    <pre id="log"></pre>
+  </div>
+</div>
+<script type="module" src="lab.js"></script>
+</body>
+</html>
