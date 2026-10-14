@@ -5,6 +5,8 @@ const LS = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
   del(k) { try { localStorage.removeItem(k); } catch {} },
 };
+const JSPI_FN = WebAssembly.Suspending;   // 元の値を保存（互換モード強制で一時的に隠すため）
+const HAS_JSPI = typeof JSPI_FN === "function";
 const CDN = (v) => "https://cdn.jsdelivr.net/npm/@wllama/wllama@" + v + "/esm/index.js";
 const WASM = (v) => "https://cdn.jsdelivr.net/npm/@wllama/wllama@" + v + "/esm/wasm/wllama.wasm";
 const HFQ = "https://huggingface.co/Qwen/";
@@ -20,6 +22,7 @@ let mod = null, modVer = null;
 let wl = null;
 let busy = false;
 let abortCtl = null;
+let loadTimer = null;
 const R = { env: [], settings: null, loadMs: null, loadErr: null, ttft: null, tps: null, chars: 0, chunks: 0, timings: null, ctxInfo: null, chatErr: null, loadedUrl: null };
 
 /* ---------- ログ（クラッシュしても残るように保存） ---------- */
@@ -57,11 +60,11 @@ async function showEnv() {
     } catch (e) { gpu = "エラー：" + e.message; }
   }
   add("WebGPU", gpu);
-  add("JSPI（高速な非同期）", typeof WebAssembly.Suspending === "function" ? "対応" : "非対応");
+  add("JSPI（高速な非同期）", HAS_JSPI ? "対応" : "非対応");
   let m64 = "非対応";
   try { if (WebAssembly.validate(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 5, 3, 1, 4, 1]))) m64 = "対応"; } catch {}
   add("MEMORY64（4GB超メモリ）", m64);
-  add("→ 互換モードが使われるか", (typeof WebAssembly.Suspending === "function" && m64 === "対応") ? "使われない見込み" : "使われる見込み（性能が下がる）");
+  add("→ 互換モードが必要か（実際）", (HAS_JSPI && m64 === "対応") ? "不要" : "必要（Safariはこちら）");
   add("複数スレッド（COOP/COEP）", self.crossOriginIsolated ? "可" : "不可（1スレッド）");
   add("CPUコア数", String(navigator.hardwareConcurrency || "?"));
   try {
@@ -110,6 +113,30 @@ function initSettings() {
   $("preset").addEventListener("change", upd); upd();
 }
 
+/* ---------- 互換モードの強制 ---------- */
+// wllamaは「JSPIとMEMORY64が使えるか」で通常版／互換版を選ぶが、iPad Safariでは
+// MEMORY64を誤って「使える」と判定し、動かない通常版を読み込んでしまう。
+// そこでJSPIを一時的に隠し、互換版が選ばれるようにする。
+function isSafariUA() {
+  const u = navigator.userAgent;
+  return /Version\/[0-9._]+.*Safari/.test(u) && !/Chrome|Chromium|Edg|Firefox/.test(u);
+}
+function applyCompatPatch(s) {
+  const force = s.compat === "force" || (s.compat === "auto" && isSafariUA());
+  try {
+    if (force) {
+      if (typeof WebAssembly.Suspending !== "undefined") {
+        Object.defineProperty(WebAssembly, "Suspending", { value: undefined, configurable: true, writable: true });
+      }
+      log("互換モードを強制します（JSPIを無効に見せる）");
+    } else if (JSPI_FN && typeof WebAssembly.Suspending === "undefined") {
+      Object.defineProperty(WebAssembly, "Suspending", { value: JSPI_FN, configurable: true, writable: true });
+      log("JSPIを元に戻しました");
+    }
+  } catch (e) { log("互換モードの強制に失敗: " + e.message); }
+  return force;
+}
+
 /* ---------- ライブラリ ---------- */
 async function getLib(ver) {
   if (mod && modVer === ver) return mod;
@@ -134,6 +161,14 @@ function makeWl(m, s) {
 }
 
 /* ---------- 読み込み／解放 ---------- */
+const seenRes = new Set();
+function newRes() {
+  try {
+    return performance.getEntriesByType("resource")
+      .filter((e) => /jsdelivr|huggingface|\.hf\.co|xethub/.test(e.name) && !seenRes.has(e.name))
+      .map((e) => { seenRes.add(e.name); return e.name.split("?")[0].split("/").slice(-2).join("/") + "(" + Math.round(e.duration) + "ms," + Math.round((e.transferSize || 0) / 1024) + "KB)"; });
+  } catch { return []; }
+}
 function setLoadState(t) { $("loadState").textContent = t; }
 async function unload() {
   if (wl) { try { await wl.exit(); } catch (e) { log("解放時の警告: " + (e && e.message)); } }
@@ -152,17 +187,26 @@ async function loadModel() {
     await unload();
     setLoadState("ライブラリを読み込み中…");
     const m = await getLib(s.ver);
+    applyCompatPatch(s);
     wl = makeWl(m, s);
     try { log("WebGPU対応(wllama判定): " + (typeof wl.isSupportWebGPU === "function" ? wl.isSupportWebGPU() : "不明")); } catch {}
     log("読み込み開始: " + s.url.split("/").pop() + " n_ctx=" + s.nctx + " gpu層=" + (s.ngl === null ? "すべて" : s.ngl) + " 互換=" + s.compat);
     setLoadState("モデルを読み込み中…（ダウンロード済みなら保存から読みます）");
     const t0 = performance.now();
-    let lastStep = -1;
+    let lastStep = -1, done100 = false;
+    const hb = setInterval(() => {
+      const sec = Math.round((performance.now() - t0) / 1000);
+      const nr = newRes();
+      log("経過 " + sec + "秒・読み込み中" + (done100 ? "（ダウンロード完了後の展開中）" : "") + (nr.length ? " 取得: " + nr.join(", ") : ""));
+      if (done100) setLoadState("ダウンロード完了。モデルを展開中…（" + sec + "秒経過）" + (sec > 60 ? " ※60秒以上止まっています。ページを開き直し、下の「結果をまとめてコピー」で状況を送ってください。" : ""));
+    }, 5000);
+    loadTimer = hb;
     const params = {
       n_ctx: s.nctx,
       useCache: true,
       progressCallback: ({ loaded, total }) => {
         const pct = total ? (loaded / total) * 100 : 0;
+        if (total && loaded >= total && !done100) { done100 = true; log("ダウンロード100%。モデルの展開を開始"); }
         $("dlBar").style.width = pct.toFixed(1) + "%";
         setLoadState("ダウンロード " + fmtB(loaded) + " / " + (total ? fmtB(total) : "?") + "（" + pct.toFixed(0) + "%）");
         const step = Math.floor(pct / 10);
@@ -187,6 +231,7 @@ async function loadModel() {
     if (e && e.stack) log(String(e.stack).split("\n").slice(0, 3).join(" | "));
     setLoadState("失敗：" + R.loadErr);
   } finally {
+    if (loadTimer) { clearInterval(loadTimer); loadTimer = null; }
     LS.del("lab.loading");
     busy = false; setBtns();
     refreshCache(); showEnv();

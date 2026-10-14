@@ -553,7 +553,7 @@ async function refreshStatus() {
   let swOk = false, appN = 0, cdnN = 0;
   try {
     swOk = !!(navigator.serviceWorker && navigator.serviceWorker.controller);
-    appN = (await (await caches.open("ioa-app-v4")).keys()).length;
+    appN = (await (await caches.open("ioa-app-v6")).keys()).length;
     cdnN = (await (await caches.open("ioa-cdn-v1")).keys()).length;
   } catch {}
   add("Service Worker", swOk ? "✅ 有効" : "⚠️ まだ有効ではありません（ページを再読み込みしてください）");

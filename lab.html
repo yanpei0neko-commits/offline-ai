@@ -53,8 +53,8 @@
     <select id="nctx"><option>512</option><option selected>1024</option><option>2048</option><option>4096</option></select>
     <label for="ngl">GPUに載せる層の数</label>
     <select id="ngl"><option value="all" selected>すべてGPU（既定・最速のはず）</option><option value="0">0（CPUのみ・比較用）</option><option value="12">12層</option><option value="24">24層</option></select>
-    <label for="compat">互換モード（Safariは必須。通常は自動のまま）</label>
-    <select id="compat"><option value="auto" selected>自動（推奨）</option><option value="off">無効（Safariでは動かないはず・比較用）</option></select>
+    <label for="compat">互換モード（Safariは必須。自動のままでOK）</label>
+    <select id="compat"><option value="auto" selected>自動（Safariでは強制・推奨）</option><option value="force">強制</option><option value="off">無効（Safariでは動かないはず・比較用）</option></select>
     <label for="ver">wllamaのバージョン</label>
     <select id="ver"><option>3.8.1</option><option>3.5.1</option></select>
   </div>

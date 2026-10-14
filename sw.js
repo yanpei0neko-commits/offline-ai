@@ -1,6 +1,6 @@
 // アプリ本体・WebLLM本体(JS)をオフライン用に保存するService Worker。
 // ※ AIモデル本体の保存はWebLLMが別のキャッシュ(Cache Storage)で行います。
-const VERSION = "v4";
+const VERSION = "v6";
 const APP_CACHE = "ioa-app-" + VERSION;
 const CDN_CACHE = "ioa-cdn-v1";
 const APP_FILES = [
