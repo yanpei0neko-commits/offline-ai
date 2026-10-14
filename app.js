@@ -6,7 +6,8 @@ const LS = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch { return false; } },
   del(k) { try { localStorage.removeItem(k); } catch {} },
 };
-const MAX_VRAM_MB = 3500;        // 一覧に出すモデルの上限（必要GPUメモリの推定値）
+const LIGHT_MAX_MB = 2000;       // 通常表示するモデルの上限（必要GPUメモリの推定値）
+const MAX_VRAM_MB = 3500;        // 「重いモデルも表示」時の上限
 const MAX_CONVS = 30;
 const SYSTEM_PROMPT = "あなたは親切で正確なAIアシスタントです。ユーザーが別の言語を使わない限り、日本語で簡潔に答えてください。";
 
@@ -18,6 +19,7 @@ let loading = false;
 let generating = false;
 let cancelLoad = null;           // ダウンロード中止用
 let lastTriedModel = null;
+let currentCtx = 4096;           // 読み込み中モデルの会話の長さ上限（トークン）
 let convs = LS.get("ioa.convs", []);
 let currentConvId = LS.get("ioa.currentConv", null);
 
@@ -42,6 +44,10 @@ function banner(text, isError = false) {
 /* ---------- エラーを分かりやすい日本語に ---------- */
 function friendlyError(e) {
   const m = String((e && (e.message || e.name)) || e);
+  if (/context window|exceeds?.*(token|context)|prompt tokens|too long/i.test(m))
+    return "会話が長くなりすぎました。\n対処：「新しい会話」を押して、新しく始めてください。\n（詳細：" + m + "）";
+  if (/shader-f16|requires feature|not.*supported by this browser/i.test(m))
+    return "このiPadのSafariはこの形式（q4f16）に対応していません。\n対処：名前に「q4f32」が付いたモデルを選んでください。\n（詳細：" + m + "）";
   if (/maxBufferSize|max.*buffer|exceeds? limit|binding size/i.test(m))
     return "このモデルはiPadのGPUが扱えるメモリ上限を超えています。\n対処：もっと小さいモデル（0.5B〜1B）を選んでください。\n（詳細：" + m + "）";
   if (/out of memory|OOM|device (was )?lost|memory/i.test(m))
@@ -144,14 +150,18 @@ function setGenUI(on) {
   $("input").disabled = on;
 }
 function trimHistory(msgs) {
-  // コンテキスト超過を避けるため、直近の発言から約6000文字ぶんだけ送る
+  // モデルの会話上限に合わせて、直近の発言だけを送る（長すぎるとエラー／メモリ増の原因）
+  const budget = Math.max(300, Math.min(3000, Math.floor(currentCtx * 0.45)));
   const out = [];
   let total = 0;
   for (let i = msgs.length - 1; i >= 0; i--) {
-    total += msgs[i].content.length;
-    if (total > 6000 && out.length > 0) break;
+    const len = msgs[i].content.length;
+    if (out.length > 0 && total + len > budget) break;
     out.unshift({ role: msgs[i].role, content: msgs[i].content });
+    total += len;
   }
+  const last = out[out.length - 1];
+  if (last && last.content.length > budget) last.content = last.content.slice(-budget);
   return out;
 }
 $("chatForm").addEventListener("submit", async (ev) => {
@@ -188,21 +198,25 @@ $("chatForm").addEventListener("submit", async (ev) => {
       messages: [{ role: "system", content: SYSTEM_PROMPT }, ...history],
       stream: true,
       stream_options: { include_usage: true },
-      temperature: 0.7,
-      max_tokens: 1024,
+      temperature: 0.5,
+      top_p: 0.9,
+      max_tokens: Math.max(128, Math.min(512, Math.floor(currentCtx / 4))),
     });
+    const box = $("messages");
+    let raf = 0;
+    const paint = () => { raf = 0; bodyEl.textContent = aiMsg.content; box.scrollTop = box.scrollHeight; };
     for await (const chunk of stream) {
       const d = chunk.choices && chunk.choices[0] && chunk.choices[0].delta && chunk.choices[0].delta.content;
       if (d) {
         aiMsg.content += d;
         n++;
-        bodyEl.textContent = aiMsg.content;
-        const box = $("messages");
-        box.scrollTop = box.scrollHeight;
-        if (n % 8 === 0) g.textContent = "生成中… " + Math.round(aiMsg.content.length) + "文字";
+        if (!raf) raf = requestAnimationFrame(paint);   // 描画は画面更新ごとに1回だけ（軽量化）
+        if (n % 16 === 0) g.textContent = "生成中… " + aiMsg.content.length + "文字";
       }
     }
-    if (!aiMsg.content) { aiMsg.content = "（空の応答でした。もう一度送信してください）"; bodyEl.textContent = aiMsg.content; }
+    if (raf) cancelAnimationFrame(raf);
+    if (!aiMsg.content) aiMsg.content = "（空の応答でした。もう一度送信してください）";
+    paint();
     const sec = ((performance.now() - t0) / 1000).toFixed(1);
     g.textContent = "完了（" + sec + "秒）";
   } catch (e) {
@@ -227,38 +241,63 @@ $("input").addEventListener("keydown", (e) => {
 });
 
 /* ---------- モデル一覧 ---------- */
-function candidateModels() {
+let gpuInfo = { f16: false, maxBuf: 0 };
+async function probeGpu() {
+  try {
+    if (!navigator.gpu) return;
+    const ad = await navigator.gpu.requestAdapter();
+    if (ad) {
+      gpuInfo.f16 = !!(ad.features && ad.features.has("shader-f16"));
+      gpuInfo.maxBuf = ad.limits.maxBufferSize || 0;
+    }
+  } catch {}
+}
+function allModels() {
   const list = (webllm && webllm.prebuiltAppConfig && webllm.prebuiltAppConfig.model_list) || [];
   return list
     .filter((m) => !/vision|embed|snowflake/i.test(m.model_id))
-    .filter((m) => !m.model_type)                       // 0 = 通常のLLM
-    .filter((m) => (m.vram_required_MB || 0) > 0 && m.vram_required_MB <= MAX_VRAM_MB)
-    .sort((a, b) => a.vram_required_MB - b.vram_required_MB);
+    .filter((m) => !m.model_type)                                   // 通常のLLMのみ
+    .filter((m) => (m.vram_required_MB || 0) > 0)
+    .filter((m) => gpuInfo.f16 || !(m.required_features || []).includes("shader-f16")); // 非対応形式は隠す
+}
+function ctxOf(m) {
+  return (m && m.overrides && m.overrides.context_window_size) || (/-1k/i.test((m && m.model_id) || "") ? 1024 : 4096);
+}
+function isOk(id) { return LS.get("ioa.ok." + id, false) === true; }
+function jaScore(id) {
+  if (/coder|code/i.test(id)) return 3;
+  if (/qwen/i.test(id)) return 0;
+  if (/gemma/i.test(id)) return 1;
+  return 2;
+}
+function visibleModels() {
+  const limit = LS.get("ioa.heavy", false) ? MAX_VRAM_MB : LIGHT_MAX_MB;
+  return allModels()
+    .filter((m) => m.vram_required_MB <= limit || isOk(m.model_id))
+    .sort((a, b) => jaScore(a.model_id) - jaScore(b.model_id) || a.vram_required_MB - b.vram_required_MB);
 }
 function jaNote(id) {
+  if (/coder|code/i.test(id)) return "日本語：コード用のため会話には不向き";
   if (/qwen/i.test(id)) return "日本語：比較的使える（Qwen系・未検証）";
   if (/gemma/i.test(id)) return "日本語：比較的使える（Gemma系・未検証）";
   if (/llama|smollm|phi|tinyllama/i.test(id)) return "日本語：弱め（英語向け・未検証）";
   return "日本語性能：未確認";
+}
+function weightLabel(mb) {
+  if (mb <= 1300) return "軽い";
+  if (mb <= 2000) return "標準";
+  return "重い（落ちやすい）";
 }
 function fmtMB(mb) { return mb >= 1024 ? (mb / 1024).toFixed(1) + " GB" : Math.round(mb) + " MB"; }
 
 function withTimeout(p, ms) {
   return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms))]);
 }
+// true=保存あり / false=なし / null=確認できず
 async function isCached(id) {
-  try { return await withTimeout(webllm.hasModelInCache(id), 4000); } catch { return null; } // null = 確認できず
+  try { return await withTimeout(webllm.hasModelInCache(id), 12000); } catch { return null; }
 }
-async function cachedMap(models) {
-  const res = {};
-  await Promise.all(models.map(async (m) => { res[m.model_id] = await isCached(m.model_id); }));
-  return res;
-}
-function jaScore(id) {
-  if (/qwen/i.test(id)) return 0;
-  if (/gemma/i.test(id)) return 1;
-  return 2;
-}
+
 let listSeq = 0;
 async function refreshModelLists() {
   const seq = ++listSeq;
@@ -271,56 +310,67 @@ async function refreshModelLists() {
       $("listNote").textContent = "WebLLMを読み込めていません。オンラインでこのページを開き直してください。";
       return;
     }
-    const models = candidateModels().sort((a, b) => jaScore(a.model_id) - jaScore(b.model_id) || a.vram_required_MB - b.vram_required_MB);
-    $("listNote").textContent = "必要GPUメモリ " + fmtMB(MAX_VRAM_MB) + " 以下のモデルのみ表示。日本語に向くQwen系・Gemma系を上に並べています。ダウンロード容量はおおよその目安です。";
-    // まず一覧をすぐ表示（保存状況の確認で止まっても一覧は見える）
+    const heavy = LS.get("ioa.heavy", false);
+    $("heavyChk").checked = heavy;
+    let note = "必要GPUメモリ " + fmtMB(heavy ? MAX_VRAM_MB : LIGHT_MAX_MB) + " 以下のモデルを表示中。日本語に向くQwen系・Gemma系を上に並べています。ダウンロード容量はおおよその目安です。";
+    if (!gpuInfo.f16) note += "\nこのiPadのSafariは「q4f16」形式に対応していないため、「q4f32」形式のみ表示しています。";
+    $("listNote").textContent = note;
+    $("listNote").style.whiteSpace = "pre-line";
+
+    const models = visibleModels();
     inst.textContent = "";
     avail.textContent = "";
-    if (models.length === 0) {
-      avail.textContent = "表示できるモデルがありません（WebLLMのモデル一覧が空です）。";
-      return;
-    }
-    const ph = document.createElement("p");
-    ph.className = "note";
-    ph.textContent = "保存状況を確認中…";
-    inst.appendChild(ph);
-    models.forEach((m) => avail.appendChild(modelCard(m, false)));
-    const cached = await cachedMap(models);
-    if (seq !== listSeq) return;     // 新しい更新が始まっていたら捨てる
-    inst.textContent = "";
-    avail.textContent = "";
-    const have = models.filter((m) => cached[m.model_id] === true);
-    const unknown = models.some((m) => cached[m.model_id] === null);
+    const have = models.filter((m) => isOk(m.model_id));
     if (have.length === 0) {
       const p = document.createElement("p");
       p.className = "note";
-      p.textContent = unknown
-        ? "保存状況を確認できませんでした（ブラウザの保存領域の応答がありません）。「状態・ヘルプ」の「アプリを初期化」を試してください。"
-        : "まだダウンロード済みのモデルはありません。";
+      p.textContent = "まだダウンロード済みのモデルはありません。";
       inst.appendChild(p);
     }
     have.forEach((m) => inst.appendChild(modelCard(m, true)));
-    models.filter((m) => cached[m.model_id] !== true).forEach((m) => avail.appendChild(modelCard(m, false)));
+    const rest = models.filter((m) => !isOk(m.model_id));
+    if (rest.length === 0) avail.textContent = "表示できるモデルがありません。「重いモデルも表示」を試してください。";
+    rest.forEach((m) => avail.appendChild(modelCard(m, false)));
+    if (!loading) verifyInstalled(have, seq);   // 実在確認は裏で、1つずつ（読み込み中は行わない）
   } catch (e) {
     inst.textContent = "";
     avail.textContent = "";
     $("listNote").textContent = "一覧の表示でエラー：" + (e && e.message ? e.message : e) + "（「状態・ヘルプ」の「アプリを初期化」を試してください）";
   }
 }
+async function verifyInstalled(have, seq) {
+  let removed = false;
+  for (const m of have) {
+    const r = await isCached(m.model_id);
+    if (seq !== listSeq || loading) return;
+    if (r === false) {          // ブラウザに無いことが確実なときだけ「保存済み」を外す
+      LS.del("ioa.ok." + m.model_id);
+      if (LS.get("ioa.last", null) === m.model_id) LS.del("ioa.last");
+      removed = true;
+    }
+  }
+  if (removed && seq === listSeq) refreshModelLists();
+}
+$("heavyChk").addEventListener("change", (e) => { LS.set("ioa.heavy", e.target.checked); refreshModelLists(); });
+
 function modelCard(m, installed) {
   const div = document.createElement("div");
   div.className = "model";
   const name = document.createElement("div");
   name.className = "name";
   name.textContent = m.model_id;
-  if (installed) { const b = document.createElement("span"); b.className = "badge ok"; b.textContent = "保存済み"; name.appendChild(b); }
-  if (installed && loadedModelId === m.model_id) { const b = document.createElement("span"); b.className = "badge ok"; b.textContent = "使用中"; name.appendChild(b); }
-  if (installed && LS.get("ioa.ok." + m.model_id, false) === false) { const b = document.createElement("span"); b.className = "badge warn"; b.textContent = "読み込み未確認"; name.appendChild(b); }
+  const badge = (t, cls) => { const b = document.createElement("span"); b.className = "badge " + (cls || ""); b.textContent = t; name.appendChild(b); };
+  if (installed) badge("保存済み", "ok");
+  if (installed && loadedModelId === m.model_id) badge("使用中", "ok");
+  if (!installed) badge(weightLabel(m.vram_required_MB), m.vram_required_MB > 2000 ? "warn" : "");
   const meta = document.createElement("div");
   meta.className = "meta";
-  const dl = Math.round(m.vram_required_MB * 0.8);
-  meta.textContent = "ダウンロード目安：約 " + fmtMB(dl) + "（概算） ／ 必要GPUメモリ（推定）：" + fmtMB(m.vram_required_MB) + "\n" + "推奨：RAMに余裕のあるiPad / 空き容量 " + fmtMB(dl * 1.3) + " 以上\n" + jaNote(m.model_id);
   meta.style.whiteSpace = "pre-line";
+  const dl = Math.round(m.vram_required_MB * 0.8);
+  const ctx = ctxOf(m);
+  meta.textContent = "ダウンロード目安：約 " + fmtMB(dl) + "（概算） ／ 必要GPUメモリ（推定）：" + fmtMB(m.vram_required_MB)
+    + "\n会話の長さ上限：約 " + ctx + " トークン" + (ctx <= 1024 ? "（短い。軽いが、すぐ忘れる）" : "")
+    + "\n" + jaNote(m.model_id);
   const row = document.createElement("div");
   row.className = "row";
   const useBtn = document.createElement("button");
@@ -377,11 +427,18 @@ async function loadModel(id) {
   if (!navigator.gpu) { showErr(friendlyError(new Error("WebGPU not available"))); return; }
   lastTriedModel = id;
   $("dlError").classList.add("hidden");
-  const m = candidateModels().find((x) => x.model_id === id) || { vram_required_MB: 1000 };
+  const m = allModels().find((x) => x.model_id === id) || { model_id: id, vram_required_MB: 1000 };
   const warn = await storageCheck(m);
   if (warn) { showErr(warn); return; }
   try { if (navigator.storage && navigator.storage.persist) await navigator.storage.persist(); } catch {}
 
+  // すでに別のモデルが読み込まれている場合は、メモリを確実に空けるためページを再読み込みしてから読み込む
+  if (engine) {
+    LS.set("ioa.next", id);
+    banner("メモリを空けるため、ページを再読み込みしてから読み込みます…");
+    setTimeout(() => location.reload(), 400);
+    return;
+  }
   loading = true;
   await unloadEngine();
   LS.set("ioa.loading", id);           // 読み込み中にSafariが落ちた場合の検出用
@@ -391,13 +448,18 @@ async function loadModel(id) {
   $("genStatus").textContent = "モデルを読み込み中…（モデル管理画面で進捗を確認できます）";
   setBusyButtons(true);
 
+  let lastProg = 0;
   const w = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
   worker = w;
   const cancelP = new Promise((_, rej) => { cancelLoad = () => rej(new Error("__cancelled__")); });
   try {
     const eng = await Promise.race([
       webllm.CreateWebWorkerMLCEngine(w, id, {
+        logLevel: "ERROR",
         initProgressCallback: (p) => {
+          const now = performance.now();
+          if (now - lastProg < 250 && (p.progress || 0) < 1) return;   // 画面更新は4回/秒まで
+          lastProg = now;
           const pct = (p.progress || 0) * 100;
           showDl(id, pct, (p.text || "") + "  (" + pct.toFixed(0) + "%)");
         },
@@ -406,6 +468,7 @@ async function loadModel(id) {
     ]);
     engine = eng;
     loadedModelId = id;
+    currentCtx = ctxOf(m);
     LS.set("ioa.last", id);
     LS.set("ioa.ok." + id, true);
     showDl(id, 100, "読み込み完了。チャットで使えます。");
@@ -490,20 +553,17 @@ async function refreshStatus() {
   let swOk = false, appN = 0, cdnN = 0;
   try {
     swOk = !!(navigator.serviceWorker && navigator.serviceWorker.controller);
-    appN = (await (await caches.open("ioa-app-v2")).keys()).length;
+    appN = (await (await caches.open("ioa-app-v3")).keys()).length;
     cdnN = (await (await caches.open("ioa-cdn-v1")).keys()).length;
   } catch {}
   add("Service Worker", swOk ? "✅ 有効" : "⚠️ まだ有効ではありません（ページを再読み込みしてください）");
   add("アプリ本体の保存", appN > 0 ? "✅ " + appN + " ファイル" : "❌ 未保存");
   add("WebLLM本体(JS)の保存", cdnN > 0 ? "✅ " + cdnN + " ファイル" : "❌ 未保存");
 
-  let nModels = 0, okModels = 0;
-  if (webllm) {
-    const models = candidateModels();
-    const cached = await cachedMap(models);
-    models.forEach((m) => { if (cached[m.model_id] === true) { nModels++; if (LS.get("ioa.ok." + m.model_id, false)) okModels++; } });
-  }
-  add("保存済みモデル", nModels + " 個（うち読み込み成功済み " + okModels + " 個）");
+  let okModels = 0;
+  if (webllm) okModels = allModels().filter((m) => isOk(m.model_id)).length;
+  add("読み込み成功済みモデル", okModels + " 個");
+  add("shader-f16（q4f16形式）", gpuInfo.f16 ? "対応" : "非対応（q4f32形式を使います）");
   add("使用中モデル", loadedModelId || "なし");
 
   try {
@@ -564,6 +624,7 @@ async function init() {
   } catch (e) {
     banner("AIエンジン(WebLLM)を読み込めませんでした。初回はインターネットに接続して開いてください。（" + (e.message || e) + "）", true);
   }
+  await probeGpu();
   currentConv();
   renderConvSelect();
   renderMessages();
@@ -572,19 +633,30 @@ async function init() {
   const crashed = LS.get("ioa.loading", null);
   if (crashed) {
     LS.del("ioa.loading");
+    LS.del("ioa.next");
     LS.del("ioa.last");
     banner("前回「" + crashed + "」の読み込み中にページが終了しました。メモリ不足の可能性が高いので、もっと小さいモデルを選んでください。", true);
     showView("models");
     return;
   }
+  // モデル切り替えのための再読み込み後は、選んだモデルをすぐ読み込む
+  const next = LS.get("ioa.next", null);
+  if (next) {
+    LS.del("ioa.next");
+    if (webllm && navigator.gpu) { showView("models"); loadModel(next); return; }
+  }
   // 前回使ったモデルが保存済みなら自動で読み込む
   const last = LS.get("ioa.last", null);
   if (webllm && navigator.gpu && last) {
-    try {
-      if (await webllm.hasModelInCache(last)) { loadModel(last); return; }
+    const r = await isCached(last);
+    if (r === true || (r === null && !navigator.onLine)) { loadModel(last); return; }
+    if (r === false) {
       banner("前回のモデルが端末から見つかりません（ブラウザが削除した可能性）。「モデル管理」から再ダウンロードしてください。", true);
       LS.del("ioa.last");
-    } catch {}
+      LS.del("ioa.ok." + last);
+    } else {
+      banner("前回のモデルの保存状況を確認できませんでした。「モデル管理」→「このモデルを使う」を押してください。", true);
+    }
   } else if (!navigator.gpu) {
     banner("このブラウザではWebGPUが使えません。iPadOS 26以降のSafariで開いてください。", true);
   }

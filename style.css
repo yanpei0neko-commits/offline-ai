@@ -61,3 +61,5 @@ table{width:100%;border-collapse:collapse}
 td{padding:8px 4px;border-bottom:1px solid var(--line);font-size:16px;vertical-align:top}
 td:first-child{color:var(--sub);width:42%}
 .help li{margin:8px 0;line-height:1.6}
+.toggle{display:flex;align-items:center;gap:10px;min-height:48px;font-size:16px}
+.toggle input{width:24px;height:24px}
