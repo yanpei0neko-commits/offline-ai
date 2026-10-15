@@ -23,7 +23,8 @@ let wl = null;
 let busy = false;
 let abortCtl = null;
 let loadTimer = null;
-const R = { env: [], settings: null, loadMs: null, loadErr: null, ttft: null, tps: null, chars: 0, chunks: 0, timings: null, ctxInfo: null, chatErr: null, loadedUrl: null };
+const R = Object.assign({ env: [], settings: null, loadMs: null, loadErr: null, ttft: null, tps: null, chars: 0, chunks: 0, timings: null, ctxInfo: null, chatErr: null, loadedUrl: null }, LS.get("lab.R", {}));
+function saveR() { LS.set("lab.R", { settings: R.settings, loadMs: R.loadMs, loadErr: R.loadErr, ttft: R.ttft, tps: R.tps, chars: R.chars, timings: R.timings, ctxInfo: R.ctxInfo, chatErr: R.chatErr }); }
 
 /* ---------- ログ（クラッシュしても残るように保存） ---------- */
 let logLines = LS.get("lab.log", []);
@@ -183,6 +184,7 @@ async function loadModel() {
   LS.set("lab.loading", s);
   R.settings = s; R.loadMs = null; R.loadErr = null; R.ttft = null; R.tps = null; R.ctxInfo = null; R.chatErr = null;
   $("dlBar").style.width = "0%";
+  $("pbar").classList.remove("hidden");
   try {
     await unload();
     setLoadState("ライブラリを読み込み中…");
@@ -219,6 +221,7 @@ async function loadModel() {
     R.loadedUrl = s.url;
     $("dlBar").style.width = "100%";
     setLoadState("読み込み完了（" + (R.loadMs / 1000).toFixed(1) + "秒）。会話テストへ進めます。");
+    setTimeout(() => $("pbar").classList.add("hidden"), 800);   // 完了したらバーを消す
     log("読み込み完了 " + (R.loadMs / 1000).toFixed(1) + "秒");
     try {
       const info = typeof wl.getLoadedContextInfo === "function" ? wl.getLoadedContextInfo() : null;
@@ -230,11 +233,12 @@ async function loadModel() {
     log("読み込み失敗: " + R.loadErr);
     if (e && e.stack) log(String(e.stack).split("\n").slice(0, 3).join(" | "));
     setLoadState("失敗：" + R.loadErr);
+    $("pbar").classList.add("hidden");
   } finally {
     if (loadTimer) { clearInterval(loadTimer); loadTimer = null; }
     LS.del("lab.loading");
     busy = false; setBtns();
-    refreshCache(); showEnv();
+    saveR(); refreshCache(); showEnv();
   }
 }
 async function exitModel() {
@@ -275,7 +279,7 @@ async function runChat(prompt, maxTokens) {
     }
   } catch (e) {
     const name = (e && e.name) || "";
-    if (/abort/i.test(name) || ac.signal.aborted) { log("生成を停止しました"); }
+    if (/abort/i.test(name) || ac.signal.aborted) { log("生成を停止しました（停止後に不安定になることがあります。次が止まったら「解放」→「読み込む」）"); }
     else { R.chatErr = name + ": " + ((e && e.message) || e); log("生成エラー: " + R.chatErr); }
   } finally {
     if (raf) cancelAnimationFrame(raf);
@@ -287,7 +291,7 @@ async function runChat(prompt, maxTokens) {
       + " ／ 速さ 約 " + (R.tps === null ? "－" : R.tps) + " トークン/秒 ／ " + R.chars + "文字 ／ 合計 " + (total / 1000).toFixed(1) + "秒"
       + (R.chatErr ? " ／ エラー：" + R.chatErr : "");
     log("生成終了 " + (total / 1000).toFixed(1) + "秒 ttft=" + R.ttft + "ms tps=" + R.tps + (R.timings ? " timings=" + JSON.stringify(R.timings).slice(0, 200) : ""));
-    LS.del("lab.generating");
+    LS.del("lab.generating"); saveR();
     abortCtl = null; busy = false; setBtns();
   }
 }

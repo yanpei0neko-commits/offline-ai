@@ -64,7 +64,10 @@
     <div id="dlError" class="errorbox hidden"></div>
     <h3>ダウンロード済みモデル</h3>
     <div id="installedList" class="list"></div>
-    <h3>利用可能なモデル</h3>
+    <h3>新エンジン：GGUF（v7.1・実験的）</h3>
+    <p class="note">別のエンジン（llama.cpp系）で動くモデルです。Safariでは「互換モード」になるため遅め（目安：1.5Bで約2トークン/秒）ですが、WebGPUのメモリ制約には強い可能性があります。落ちないよう、会話の長さ・返答の長さを短く固定しています。</p>
+    <div id="ggufList" class="list"></div>
+    <h3>利用可能なモデル（WebLLMエンジン）</h3>
     <label class="toggle"><input type="checkbox" id="heavyChk"> 重いモデルも表示（メモリ不足で落ちやすくなります）</label>
     <p class="note" id="listNote"></p>
     <div id="availableList" class="list"></div>

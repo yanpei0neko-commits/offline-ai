@@ -20,6 +20,10 @@ let generating = false;
 let cancelLoad = null;           // ダウンロード中止用
 let lastTriedModel = null;
 let currentCtx = 4096;           // 読み込み中モデルの会話の長さ上限（トークン）
+let currentMaxOut = 512;         // 1回の返答の最大トークン
+let currentKind = "webllm";      // 使用中エンジン："webllm" | "gguf"
+let stopRequested = false;
+let gguf = null;                 // gguf.js（新エンジン）
 let convs = LS.get("ioa.convs", []);
 let currentConvId = LS.get("ioa.currentConv", null);
 
@@ -44,6 +48,8 @@ function banner(text, isError = false) {
 /* ---------- エラーを分かりやすい日本語に ---------- */
 function friendlyError(e) {
   const m = String((e && (e.message || e.name)) || e);
+  if (/crashed|Buffer map|止まりました|STALL/i.test(m))
+    return "AIエンジンが止まりました（長い入力・出力でメモリ不足になった可能性）。\n対処：次の送信時に自動で再準備します。入力を短くするか、「新しい会話」にしてください。\n（詳細：" + m + "）";
   if (/context window|exceeds?.*(token|context)|prompt tokens|too long/i.test(m))
     return "会話が長くなりすぎました。\n対処：「新しい会話」を押して、新しく始めてください。\n（詳細：" + m + "）";
   if (/shader-f16|requires feature|not.*supported by this browser/i.test(m))
@@ -151,7 +157,9 @@ function setGenUI(on) {
 }
 function trimHistory(msgs) {
   // モデルの会話上限に合わせて、直近の発言だけを送る（長すぎるとエラー／メモリ増の原因）
-  const budget = Math.max(300, Math.min(3000, Math.floor(currentCtx * 0.45)));
+  const budget = currentKind === "gguf"
+    ? Math.max(200, currentCtx - currentMaxOut - 100)               // 日本語は約1文字=1トークンと見て余裕を持つ
+    : Math.max(300, Math.min(3000, Math.floor(currentCtx * 0.45)));
   const out = [];
   let total = 0;
   for (let i = msgs.length - 1; i >= 0; i--) {
@@ -191,34 +199,38 @@ $("chatForm").addEventListener("submit", async (ev) => {
   g.classList.remove("hidden");
   g.textContent = "生成中…（停止ボタンで中断できます）";
   const t0 = performance.now();
-  let n = 0;
+  let n = 0, cutNote = "";
+  stopRequested = false;
+  LS.set("ioa.generating", loadedModelId);
   try {
     const history = trimHistory(c.messages.slice(0, -1));
-    const stream = await engine.chat.completions.create({
-      messages: [{ role: "system", content: SYSTEM_PROMPT }, ...history],
-      stream: true,
-      stream_options: { include_usage: true },
-      temperature: 0.5,
-      top_p: 0.9,
-      max_tokens: Math.max(128, Math.min(512, Math.floor(currentCtx / 4))),
+    const lastLen = c.messages[c.messages.length - 2].content.length;
+    if (history.length && history[history.length - 1].content.length < lastLen) {
+      cutNote = "（入力が長いため末尾 " + history[history.length - 1].content.length + " 文字だけ使用）";
+      g.textContent = "生成中… " + cutNote;
+    }
+    const sys = currentKind === "gguf" ? "日本語で簡潔に答えてください。" : SYSTEM_PROMPT;
+    const stream = engine.chat([{ role: "system", content: sys }, ...history], {
+      maxTokens: currentKind === "gguf" ? currentMaxOut : Math.max(128, Math.min(512, Math.floor(currentCtx / 4))),
     });
     const box = $("messages");
     let raf = 0;
     const paint = () => { raf = 0; bodyEl.textContent = aiMsg.content; box.scrollTop = box.scrollHeight; };
-    for await (const chunk of stream) {
-      const d = chunk.choices && chunk.choices[0] && chunk.choices[0].delta && chunk.choices[0].delta.content;
+    for await (const d of stream) {
       if (d) {
         aiMsg.content += d;
         n++;
         if (!raf) raf = requestAnimationFrame(paint);   // 描画は画面更新ごとに1回だけ（軽量化）
-        if (n % 16 === 0) g.textContent = "生成中… " + aiMsg.content.length + "文字";
+        if (n % 16 === 0) g.textContent = "生成中… " + aiMsg.content.length + "文字" + cutNote;
       }
     }
     if (raf) cancelAnimationFrame(raf);
     if (!aiMsg.content) aiMsg.content = "（空の応答でした。もう一度送信してください）";
     paint();
     const sec = ((performance.now() - t0) / 1000).toFixed(1);
-    g.textContent = "完了（" + sec + "秒）";
+    g.textContent = stopRequested
+      ? "停止しました" + (currentKind === "gguf" ? "（次の送信時にエンジンを自動で再準備します）" : "")
+      : "完了（" + sec + "秒）" + cutNote;
   } catch (e) {
     const msg = friendlyError(e);
     aiMsg.content = (aiMsg.content ? aiMsg.content + "\n\n" : "") + "⚠️ " + msg;
@@ -226,14 +238,15 @@ $("chatForm").addEventListener("submit", async (ev) => {
     renderMessages();
     g.textContent = "エラーで停止しました";
   } finally {
+    LS.del("ioa.generating");
     setGenUI(false);
     saveConvs();
     $("input").focus();
   }
 });
 $("stopBtn").addEventListener("click", async () => {
-  try { if (engine) await engine.interruptGenerate(); } catch {}
-  $("genStatus").textContent = "停止しました";
+  stopRequested = true;
+  try { if (engine) await engine.stop(); } catch {}
 });
 $("input").addEventListener("keydown", (e) => {
   // Cmd/Ctrl+Enter で送信（外付けキーボード用）
@@ -260,6 +273,10 @@ function allModels() {
     .filter((m) => (m.vram_required_MB || 0) > 0)
     .filter((m) => gpuInfo.f16 || !(m.required_features || []).includes("shader-f16")); // 非対応形式は隠す
 }
+function ggufEntries() {
+  return gguf ? gguf.GGUF_MODELS.map((m) => ({ ...m, model_id: m.id, vram_required_MB: Math.round(m.dlMB * 1.6) })) : [];
+}
+function findModel(id) { return allModels().find((x) => x.model_id === id) || ggufEntries().find((x) => x.model_id === id); }
 function ctxOf(m) {
   return (m && m.overrides && m.overrides.context_window_size) || (/-1k/i.test((m && m.model_id) || "") ? 1024 : 4096);
 }
@@ -304,10 +321,10 @@ async function refreshModelLists() {
   const inst = $("installedList");
   const avail = $("availableList");
   try {
-    if (!webllm) {
+    if (!webllm && !gguf) {
       inst.textContent = "";
       avail.textContent = "";
-      $("listNote").textContent = "WebLLMを読み込めていません。オンラインでこのページを開き直してください。";
+      $("listNote").textContent = "AIエンジンを読み込めていません。オンラインでこのページを開き直してください。";
       return;
     }
     const heavy = LS.get("ioa.heavy", false);
@@ -317,10 +334,15 @@ async function refreshModelLists() {
     $("listNote").textContent = note;
     $("listNote").style.whiteSpace = "pre-line";
 
-    const models = visibleModels();
+    const gg = ggufEntries();
+    const models = webllm ? visibleModels() : [];
     inst.textContent = "";
     avail.textContent = "";
-    const have = models.filter((m) => isOk(m.model_id));
+    const ggBox = $("ggufList");
+    ggBox.textContent = "";
+    gg.filter((m) => !isOk(m.model_id)).forEach((m) => ggBox.appendChild(modelCard(m, false)));
+    if (!gg.length) ggBox.textContent = "GGUFエンジンを読み込めていません（オンラインで開き直してください）。";
+    const have = [...models, ...gg].filter((m) => isOk(m.model_id));
     if (have.length === 0) {
       const p = document.createElement("p");
       p.className = "note";
@@ -329,9 +351,10 @@ async function refreshModelLists() {
     }
     have.forEach((m) => inst.appendChild(modelCard(m, true)));
     const rest = models.filter((m) => !isOk(m.model_id));
+    if (!webllm) rest.length = 0;
     if (rest.length === 0) avail.textContent = "表示できるモデルがありません。「重いモデルも表示」を試してください。";
     rest.forEach((m) => avail.appendChild(modelCard(m, false)));
-    if (!loading) verifyInstalled(have, seq);   // 実在確認は裏で、1つずつ（読み込み中は行わない）
+    if (!loading) verifyInstalled(have.filter((m) => m.kind !== "gguf"), seq);   // 実在確認は裏で、1つずつ（読み込み中は行わない）
   } catch (e) {
     inst.textContent = "";
     avail.textContent = "";
@@ -358,24 +381,26 @@ function modelCard(m, installed) {
   div.className = "model";
   const name = document.createElement("div");
   name.className = "name";
-  name.textContent = m.model_id;
+  name.textContent = m.kind === "gguf" ? m.name : m.model_id;
   const badge = (t, cls) => { const b = document.createElement("span"); b.className = "badge " + (cls || ""); b.textContent = t; name.appendChild(b); };
   if (installed) badge("保存済み", "ok");
   if (installed && loadedModelId === m.model_id) badge("使用中", "ok");
-  if (!installed) badge(weightLabel(m.vram_required_MB), m.vram_required_MB > 2000 ? "warn" : "");
+  if (m.kind === "gguf") badge("GGUF・新エンジン", "warn");
+  else if (!installed) badge(weightLabel(m.vram_required_MB), m.vram_required_MB > 2000 ? "warn" : "");
   const meta = document.createElement("div");
   meta.className = "meta";
   meta.style.whiteSpace = "pre-line";
-  const dl = Math.round(m.vram_required_MB * 0.8);
-  const ctx = ctxOf(m);
-  meta.textContent = "ダウンロード目安：約 " + fmtMB(dl) + "（概算） ／ 必要GPUメモリ（推定）：" + fmtMB(m.vram_required_MB)
+  const dl = m.kind === "gguf" ? m.dlMB : Math.round(m.vram_required_MB * 0.8);
+  const ctx = m.kind === "gguf" ? m.ctx : ctxOf(m);
+  meta.textContent = "ダウンロード目安：約 " + fmtMB(dl) + (m.kind === "gguf" ? "" : "（概算） ／ 必要GPUメモリ（推定）：" + fmtMB(m.vram_required_MB))
     + "\n会話の長さ上限：約 " + ctx + " トークン" + (ctx <= 1024 ? "（短い。軽いが、すぐ忘れる）" : "")
-    + "\n" + jaNote(m.model_id);
+    + (m.kind === "gguf" ? "\n速さ：" + m.speed + " ／ 1回の返答：最大 " + m.maxOut + " トークン\n" + m.note : "\n" + jaNote(m.model_id));
   const row = document.createElement("div");
   row.className = "row";
   const useBtn = document.createElement("button");
   useBtn.className = "big primary";
-  useBtn.textContent = installed ? "このモデルを使う" : "ダウンロードして読み込む";
+  const inUse = installed && loadedModelId === m.model_id && !!engine;
+  useBtn.textContent = inUse ? "使用中（チャットへ）" : installed ? "このモデルを使う" : "ダウンロードして読み込む";
   useBtn.disabled = loading || generating;
   useBtn.addEventListener("click", () => loadModel(m.model_id));
   row.appendChild(useBtn);
@@ -398,10 +423,12 @@ async function unloadEngine() {
   engine = null;
   worker = null;
   loadedModelId = null;
+  currentKind = "webllm";
   updateCurrentLabel();
 }
 function updateCurrentLabel(extra) {
-  $("currentModel").textContent = "モデル：" + (extra || loadedModelId || "未読み込み");
+  const mm = loadedModelId && findModel(loadedModelId);
+  $("currentModel").textContent = "モデル：" + (extra || (mm && mm.name) || loadedModelId || "未読み込み");
 }
 function showDl(title, pct, text) {
   $("dlPanel").classList.remove("hidden");
@@ -413,7 +440,7 @@ async function storageCheck(m) {
   try {
     if (navigator.storage && navigator.storage.estimate) {
       const { usage, quota } = await navigator.storage.estimate();
-      const need = m.vram_required_MB * 0.8 * 1024 * 1024 * 1.2;
+      const need = (m.dlMB || m.vram_required_MB * 0.8) * 1024 * 1024 * 1.2;
       if (quota && usage != null && quota - usage < need) {
         return "保存できる容量が足りない可能性があります（空き約 " + fmtMB((quota - usage) / 1048576) + "、必要目安 " + fmtMB(need / 1048576) + "）。不要なモデルを削除してください。";
       }
@@ -421,13 +448,33 @@ async function storageCheck(m) {
   } catch {}
   return null;
 }
+function wrapWebllm(e) {
+  return {
+    kind: "webllm",
+    async *chat(messages, { maxTokens }) {
+      const st = await e.chat.completions.create({
+        messages, stream: true, stream_options: { include_usage: true },
+        temperature: 0.5, top_p: 0.9, max_tokens: maxTokens,
+      });
+      for await (const c of st) {
+        const d = c.choices && c.choices[0] && c.choices[0].delta && c.choices[0].delta.content;
+        if (d) yield d;
+      }
+    },
+    async stop() { await e.interruptGenerate(); },
+    async unload() { await e.unload(); },
+  };
+}
 async function loadModel(id) {
   if (loading || generating) return;
-  if (!webllm) { banner("WebLLMを読み込めていません。オンラインでページを開き直してください。", true); return; }
+  if (engine && loadedModelId === id) { banner("このモデルはすでに使用中です。チャットへどうぞ。"); showView("chat"); return; }
+  const isG = id.startsWith("gguf:");
+  if (isG && !gguf) { banner("GGUFエンジンを読み込めていません。オンラインでページを開き直してください。", true); return; }
+  if (!isG && !webllm) { banner("WebLLMを読み込めていません。オンラインでページを開き直してください。", true); return; }
   if (!navigator.gpu) { showErr(friendlyError(new Error("WebGPU not available"))); return; }
   lastTriedModel = id;
   $("dlError").classList.add("hidden");
-  const m = allModels().find((x) => x.model_id === id) || { model_id: id, vram_required_MB: 1000 };
+  const m = findModel(id) || { model_id: id, vram_required_MB: 1000 };
   const warn = await storageCheck(m);
   if (warn) { showErr(warn); return; }
   try { if (navigator.storage && navigator.storage.persist) await navigator.storage.persist(); } catch {}
@@ -442,44 +489,70 @@ async function loadModel(id) {
   loading = true;
   await unloadEngine();
   LS.set("ioa.loading", id);           // 読み込み中にSafariが落ちた場合の検出用
-  updateCurrentLabel("読み込み中… " + id);
-  showDl(id, 0, "準備中…");
+  updateCurrentLabel("読み込み中… " + (m.name || id));
+  showDl(m.name || id, 0, "準備中…");
   $("genStatus").classList.remove("hidden");
   $("genStatus").textContent = "モデルを読み込み中…（モデル管理画面で進捗を確認できます）";
   setBusyButtons(true);
 
   let lastProg = 0;
-  const w = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
-  worker = w;
+  let w = null;
   const cancelP = new Promise((_, rej) => { cancelLoad = () => rej(new Error("__cancelled__")); });
   try {
-    const eng = await Promise.race([
-      webllm.CreateWebWorkerMLCEngine(w, id, {
-        logLevel: "ERROR",
-        initProgressCallback: (p) => {
-          const now = performance.now();
-          if (now - lastProg < 250 && (p.progress || 0) < 1) return;   // 画面更新は4回/秒まで
-          lastProg = now;
-          const pct = (p.progress || 0) * 100;
-          showDl(id, pct, (p.text || "") + "  (" + pct.toFixed(0) + "%)");
-        },
-      }),
-      cancelP,
-    ]);
-    engine = eng;
+    let wrapped;
+    if (isG) {
+      wrapped = await Promise.race([
+        gguf.loadGguf(m, {
+          onProgress: (p, l, t) => {
+            const now = performance.now();
+            if (now - lastProg < 250 && p < 1) return;
+            lastProg = now;
+            showDl(m.name, p * 100, t ? fmtMB(l / 1048576) + " / " + fmtMB(t / 1048576) + "  (" + (p * 100).toFixed(0) + "%)" + (p >= 1 ? "\nモデルを展開中…（1分ほどかかることがあります）" : "") : "");
+          },
+          onStatus: (t) => { $("genStatus").classList.remove("hidden"); $("genStatus").textContent = t; },
+        }),
+        cancelP,
+      ]);
+    } else {
+      w = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+      worker = w;
+      const eng = await Promise.race([
+        webllm.CreateWebWorkerMLCEngine(w, id, {
+          logLevel: "ERROR",
+          initProgressCallback: (p) => {
+            const now = performance.now();
+            if (now - lastProg < 250 && (p.progress || 0) < 1) return;   // 画面更新は4回/秒まで
+            lastProg = now;
+            const pct = (p.progress || 0) * 100;
+            showDl(id, pct, (p.text || "") + "  (" + pct.toFixed(0) + "%)");
+          },
+        }),
+        cancelP,
+      ]);
+      wrapped = wrapWebllm(eng);
+    }
+    engine = wrapped;
     loadedModelId = id;
-    currentCtx = ctxOf(m);
+    currentKind = isG ? "gguf" : "webllm";
+    currentCtx = isG ? m.ctx : ctxOf(m);
+    currentMaxOut = isG ? m.maxOut : Math.max(128, Math.min(512, Math.floor(currentCtx / 4)));
     LS.set("ioa.last", id);
     LS.set("ioa.ok." + id, true);
-    showDl(id, 100, "読み込み完了。チャットで使えます。");
-    setTimeout(() => $("dlPanel").classList.add("hidden"), 1500);
+    showDl(m.name || id, 100, "読み込み完了。チャットで使えます。");
+    setTimeout(() => $("dlPanel").classList.add("hidden"), 800);
     banner("");
   } catch (e) {
-    try { w.terminate(); } catch {}
+    if (w) { try { w.terminate(); } catch {} }
     worker = null;
     engine = null;
     if (String(e && e.message) === "__cancelled__") {
       $("dlPanel").classList.add("hidden");
+      if (isG) {   // 裏で読み込みが続くため、ページを再読み込みして確実に止める
+        LS.del("ioa.loading");
+        LS.set("ioa.msg", "ダウンロードをキャンセルしました。");
+        location.reload();
+        return;
+      }
       showErr("ダウンロードをキャンセルしました。保存済みのファイルは再利用されるため、続きから再開できます（ファイル単位）。");
     } else {
       $("dlPanel").classList.add("hidden");
@@ -518,10 +591,11 @@ function setBusyButtons(busy) {
 $("cancelDlBtn").addEventListener("click", () => { if (cancelLoad) cancelLoad(); });
 
 async function deleteModel(id) {
-  if (!confirm(id + " を削除します。再び使うには再ダウンロードが必要です。よろしいですか？")) return;
+  if (!confirm((id.startsWith("gguf:") ? findModel(id).name : id) + " を削除します。再び使うには再ダウンロードが必要です。よろしいですか？")) return;
   try {
     if (loadedModelId === id) await unloadEngine();
-    await webllm.deleteModelAllInfoInCache(id);
+    if (id.startsWith("gguf:")) await gguf.deleteGguf(findModel(id));
+    else await webllm.deleteModelAllInfoInCache(id);
     LS.del("ioa.ok." + id);
     if (LS.get("ioa.last", null) === id) LS.del("ioa.last");
   } catch (e) {
@@ -553,7 +627,7 @@ async function refreshStatus() {
   let swOk = false, appN = 0, cdnN = 0;
   try {
     swOk = !!(navigator.serviceWorker && navigator.serviceWorker.controller);
-    appN = (await (await caches.open("ioa-app-v6")).keys()).length;
+    appN = (await (await caches.open("ioa-app-v71")).keys()).length;
     cdnN = (await (await caches.open("ioa-cdn-v1")).keys()).length;
   } catch {}
   add("Service Worker", swOk ? "✅ 有効" : "⚠️ まだ有効ではありません（ページを再読み込みしてください）");
@@ -562,6 +636,8 @@ async function refreshStatus() {
 
   let okModels = 0;
   if (webllm) okModels = allModels().filter((m) => isOk(m.model_id)).length;
+  okModels += ggufEntries().filter((m) => isOk(m.model_id)).length;
+  add("GGUFエンジン(wllama)", gguf ? "✅ 読み込み成功" : "❌ 失敗（オンラインで開き直してください）");
   add("読み込み成功済みモデル", okModels + " 個");
   add("shader-f16（q4f16形式）", gpuInfo.f16 ? "対応" : "非対応（q4f32形式を使います）");
   add("使用中モデル", loadedModelId || "なし");
@@ -624,12 +700,20 @@ async function init() {
   } catch (e) {
     banner("AIエンジン(WebLLM)を読み込めませんでした。初回はインターネットに接続して開いてください。（" + (e.message || e) + "）", true);
   }
+  try { gguf = await import("./gguf.js"); } catch (e) { console.warn("gguf.js", e); }
   await probeGpu();
   currentConv();
   renderConvSelect();
   renderMessages();
   updateCurrentLabel();
 
+  const msg0 = LS.get("ioa.msg", null);
+  if (msg0) { LS.del("ioa.msg"); banner(msg0); }
+  const crashedGen = LS.get("ioa.generating", null);
+  if (crashedGen) {
+    LS.del("ioa.generating");
+    banner("前回、返答の生成中にページが終了しました（長い入力・出力でメモリ不足になった可能性）。短めの質問にするか、より小さいモデルを使ってください。", true);
+  }
   const crashed = LS.get("ioa.loading", null);
   if (crashed) {
     LS.del("ioa.loading");
@@ -643,11 +727,13 @@ async function init() {
   const next = LS.get("ioa.next", null);
   if (next) {
     LS.del("ioa.next");
-    if (webllm && navigator.gpu) { showView("models"); loadModel(next); return; }
+    if ((webllm || (next.startsWith("gguf:") && gguf)) && navigator.gpu) { showView("models"); loadModel(next); return; }
   }
   // 前回使ったモデルが保存済みなら自動で読み込む
   const last = LS.get("ioa.last", null);
-  if (webllm && navigator.gpu && last) {
+  if (gguf && navigator.gpu && last && last.startsWith("gguf:") && isOk(last) && !crashedGen) {
+    loadModel(last);       // GGUFは保存フラグだけで自動読み込み（保存分から読む）
+  } else if (webllm && navigator.gpu && last && !last.startsWith("gguf:")) {
     const r = await isCached(last);
     if (r === true || (r === null && !navigator.onLine)) { loadModel(last); return; }
     if (r === false) {
