@@ -72,7 +72,7 @@ export async function loadGguf(model, { onProgress, onStatus } = {}) {
       try {
         const stream = await withTimeout(wl.createChatCompletion({
           messages, stream: true, abortSignal: mine.signal,
-          max_tokens: Math.min(maxTokens, model.maxOut), temperature: 0.5, top_p: 0.9,
+          max_tokens: maxTokens, temperature: 0.5, top_p: 0.9,
         }), 120000, "STALL");
         const it = stream[Symbol.asyncIterator]();
         let first = true;

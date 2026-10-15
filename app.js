@@ -23,6 +23,22 @@ let currentCtx = 4096;           // 読み込み中モデルの会話の長さ�
 let currentMaxOut = 512;         // 1回の返答の最大トークン
 let currentKind = "webllm";      // 使用中エンジン："webllm" | "gguf"
 let stopRequested = false;
+let currentModelObj = null;
+// 返答の長さ上限。標準=安全寄り / 長め / 最大=会話の長さの大半まで（メモリ不足で落ちやすい）
+function computeMaxOut() {
+  const mode = LS.get("ioa.out", "std");
+  const m = currentModelObj;
+  if (currentKind === "gguf") {
+    const std = (m && m.maxOut) || 160;
+    if (mode === "long") return Math.min(Math.floor(currentCtx * 0.5), std * 3);
+    if (mode === "max") return Math.floor(currentCtx * 0.75);
+    return std;
+  }
+  if (mode === "long") return Math.min(1024, Math.floor(currentCtx * 0.5));
+  if (mode === "max") return Math.floor(currentCtx * 0.7);
+  return Math.max(128, Math.min(512, Math.floor(currentCtx / 4)));
+}
+function applyOutMode() { currentMaxOut = computeMaxOut(); }
 let gguf = null;                 // gguf.js（新エンジン）
 let convs = LS.get("ioa.convs", []);
 let currentConvId = LS.get("ioa.currentConv", null);
@@ -211,7 +227,7 @@ $("chatForm").addEventListener("submit", async (ev) => {
     }
     const sys = currentKind === "gguf" ? "日本語で簡潔に答えてください。" : SYSTEM_PROMPT;
     const stream = engine.chat([{ role: "system", content: sys }, ...history], {
-      maxTokens: currentKind === "gguf" ? currentMaxOut : Math.max(128, Math.min(512, Math.floor(currentCtx / 4))),
+      maxTokens: currentMaxOut,
     });
     const box = $("messages");
     let raf = 0;
@@ -247,6 +263,12 @@ $("chatForm").addEventListener("submit", async (ev) => {
 $("stopBtn").addEventListener("click", async () => {
   stopRequested = true;
   try { if (engine) await engine.stop(); } catch {}
+});
+$("outSel").value = LS.get("ioa.out", "std");
+$("outSel").addEventListener("change", (e) => {
+  LS.set("ioa.out", e.target.value);
+  applyOutMode();
+  if (e.target.value === "max") banner("返答を最大にすると、入力に使える長さが減り、メモリ不足で落ちやすくなります。落ちたら「標準」に戻してください。");
 });
 $("input").addEventListener("keydown", (e) => {
   // Cmd/Ctrl+Enter で送信（外付けキーボード用）
@@ -424,6 +446,7 @@ async function unloadEngine() {
   worker = null;
   loadedModelId = null;
   currentKind = "webllm";
+  currentModelObj = null;
   updateCurrentLabel();
 }
 function updateCurrentLabel(extra) {
@@ -535,7 +558,8 @@ async function loadModel(id) {
     loadedModelId = id;
     currentKind = isG ? "gguf" : "webllm";
     currentCtx = isG ? m.ctx : ctxOf(m);
-    currentMaxOut = isG ? m.maxOut : Math.max(128, Math.min(512, Math.floor(currentCtx / 4)));
+    currentModelObj = m;
+    applyOutMode();
     LS.set("ioa.last", id);
     LS.set("ioa.ok." + id, true);
     showDl(m.name || id, 100, "読み込み完了。チャットで使えます。");
