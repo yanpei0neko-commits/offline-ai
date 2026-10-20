@@ -5,9 +5,14 @@ const VER = "3.8.1";
 const CDN = "https://cdn.jsdelivr.net/npm/@wllama/wllama@" + VER + "/esm/index.js";
 const WASM = "https://cdn.jsdelivr.net/npm/@wllama/wllama@" + VER + "/esm/wasm/wllama.wasm";
 const HFQ = "https://huggingface.co/Qwen/";
+const HFG = "https://huggingface.co/bartowski/gemma-2-2b-jpn-it-GGUF/resolve/main/";
 
 // ctx=会話の長さ(トークン), maxOut=1回の返答の最大トークン。重いほど小さくして落ちにくくしている。
 export const GGUF_MODELS = [
+  { key: "gemma2-jpn-q4km", name: "Gemma-2-2B 日本語版 Q4_K_M（GGUF）", dlMB: 1750, ctx: 1024, maxOut: 192, noSystem: true, speed: "遅め（未検証・1〜2トークン/秒の見込み）", note: "日本語向けに追加学習されたGoogleのモデル。標準画質（Q4）。本命。",
+    url: HFG + "gemma-2-2b-jpn-it-Q4_K_M.gguf" },
+  { key: "gemma2-jpn-iq3m", name: "Gemma-2-2B 日本語版 IQ3_M・小さめ（GGUF）", dlMB: 1420, ctx: 1024, maxOut: 192, noSystem: true, speed: "遅め（未検証）", note: "約20%小さいが、圧縮が強いぶん少し精度が落ちます。Q4が落ちるときの代替。",
+    url: HFG + "gemma-2-2b-jpn-it-IQ3_M.gguf" },
   { key: "qwen25-05b", name: "Qwen2.5-0.5B（GGUF）", dlMB: 400, ctx: 2048, maxOut: 320, speed: "速い（実測：未）", note: "最軽量。賢さは控えめ。",
     url: HFQ + "Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf" },
   { key: "qwen25-15b", name: "Qwen2.5-1.5B（GGUF）", dlMB: 1100, ctx: 1024, maxOut: 160, speed: "遅め（実測：約2トークン/秒）", note: "日本語は0.5Bより自然。長文で落ちやすいため、入力・出力を短めに制限。",

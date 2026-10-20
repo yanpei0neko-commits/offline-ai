@@ -226,7 +226,15 @@ $("chatForm").addEventListener("submit", async (ev) => {
       g.textContent = "生成中… " + cutNote;
     }
     const sys = currentKind === "gguf" ? "日本語で簡潔に答えてください。" : SYSTEM_PROMPT;
-    const stream = engine.chat([{ role: "system", content: sys }, ...history], {
+    let msgs;
+    if (currentModelObj && currentModelObj.noSystem) {
+      // Gemma系はsystemロールを受け付けない／先頭はuserである必要がある → 指示を最初のuser発言に合体
+      const h = history.slice();
+      while (h.length && h[0].role !== "user") h.shift();
+      if (h.length) h[0] = { role: "user", content: sys + "\n\n" + h[0].content };
+      msgs = h;
+    } else msgs = [{ role: "system", content: sys }, ...history];
+    const stream = engine.chat(msgs, {
       maxTokens: currentMaxOut,
     });
     const box = $("messages");
